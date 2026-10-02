@@ -67,6 +67,30 @@ func apiClient(cityPath string) *api.Client {
 	return apiRouteSupervisorClientHook(cityPath)
 }
 
+// supervisorFallthroughAPIClient is apiClient for callers with no local
+// fallback (maintenance, extmsg). A supervisor-managed city omits a standalone
+// [api] port (the supervisor serves the API on its own port via city-scoped
+// routes), so apiClient returns nil even though the controller socket is
+// alive; route to the supervisor-managed client directly rather than
+// reporting controller-down. General commands keep apiClient's nil→local
+// fallback. (gascity ga-tp7)
+func supervisorFallthroughAPIClient(cityPath string) (*api.Client, string) {
+	if c := apiClient(cityPath); c != nil {
+		return c, ""
+	}
+	// Honor the GC_NO_API escape hatch: apiClient returns nil under it, and the
+	// alive-hook/supervisor client below never re-check it, so without this guard
+	// an explicit operator opt-out would be silently bypassed here.
+	if disabled, _ := classifyGCNoAPI(os.Getenv("GC_NO_API")); !disabled {
+		if apiRouteControllerAliveHook(cityPath) != 0 {
+			if c := apiRouteSupervisorClientHook(cityPath); c != nil {
+				return c, ""
+			}
+		}
+	}
+	return nil, apiClientFallbackReason(cityPath)
+}
+
 // standaloneControllerClient builds an API client for a standalone controller
 // that binds cfg.API.Port from city.toml. It returns nil — the signal for
 // apiClient to fall through to the supervisor-managed client — when no usable

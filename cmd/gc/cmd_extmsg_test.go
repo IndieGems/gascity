@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/extmsg"
 )
 
@@ -120,5 +121,25 @@ func TestPrintExtMsgBindingOutputs(t *testing.T) {
 		if !strings.Contains(human, want) {
 			t.Fatalf("human output = %q, want it to contain %q", human, want)
 		}
+	}
+}
+
+// TestExtMsgClientRoutesToSupervisor: bindings have no local fallback, so a
+// supervisor-managed city (controller alive, no standalone [api] port) must
+// route to the supervisor's API instead of failing "requires the city API
+// server".
+func TestExtMsgClientRoutesToSupervisor(t *testing.T) {
+	sentinel := api.NewClient("http://supervisor.sentinel:1")
+	origAlive, origSup := apiRouteControllerAliveHook, apiRouteSupervisorClientHook
+	t.Cleanup(func() {
+		apiRouteControllerAliveHook = origAlive
+		apiRouteSupervisorClientHook = origSup
+	})
+	t.Setenv("GC_NO_API", "")
+	apiRouteControllerAliveHook = func(string) int { return 4242 }
+	apiRouteSupervisorClientHook = func(string) *api.Client { return sentinel }
+	dir := writeCityTOMLForRoute(t, t.TempDir(), "name = \"t\"\n")
+	if got, reason := extMsgAPIClient(dir); got != sentinel {
+		t.Fatalf("extMsgAPIClient = %p (reason %q), want supervisor sentinel %p", got, reason, sentinel)
 	}
 }

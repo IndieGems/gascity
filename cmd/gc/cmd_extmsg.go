@@ -99,6 +99,9 @@ func (f *extMsgConversationFlags) conversationRefIfSet(cityPath string) (*extmsg
 	return &ref, nil
 }
 
+// extMsgAPIClient is indirected through a var so tests can observe routing.
+var extMsgAPIClient = supervisorFallthroughAPIClient
+
 // extMsgClient resolves the city and returns its API client, failing with
 // a uniform message when the API is unavailable.
 func extMsgClient(verb string, stderr io.Writer) (*api.Client, string, bool) {
@@ -107,7 +110,9 @@ func extMsgClient(verb string, stderr io.Writer) (*api.Client, string, bool) {
 		fmt.Fprintf(stderr, "gc extmsg %s: %v\n", verb, err) //nolint:errcheck // best-effort stderr
 		return nil, "", false
 	}
-	c := apiClient(cityPath)
+	// Bindings have no local fallback, so a supervisor-managed city (no
+	// standalone [api] port) must reach the supervisor's API.
+	c, _ := extMsgAPIClient(cityPath)
 	if c == nil {
 		fmt.Fprintf(stderr, "gc extmsg %s: requires the city API server (no local fallback for conversation bindings)\n", verb) //nolint:errcheck // best-effort stderr
 		return nil, "", false
