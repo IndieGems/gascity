@@ -66,6 +66,7 @@ go_test(
         "invocation_telemetry_recording_test.go",
         "invocation_telemetry_test.go",
         "invocation_telemetry_usagefact_test.go",
+        "invocation_usage_sweep_test.go",
         "normalize_entry_invariants_test.go",
         "observe_capability_test.go",
         "operation_events_1a_test.go",

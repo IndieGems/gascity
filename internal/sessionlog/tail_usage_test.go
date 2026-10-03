@@ -1,6 +1,7 @@
 package sessionlog
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -373,8 +374,11 @@ func TestExtractTailUsageFromSearchPathsRejectsEscapedPath(t *testing.T) {
 		},
 	}})
 
-	if _, err := ExtractTailUsageFromSearchPaths([]string{root}, outside); err == nil {
-		t.Fatal("ExtractTailUsageFromSearchPaths outside root = nil error, want rejection")
+	if _, err := ExtractTailUsageFromSearchPaths([]string{root}, outside); !errors.Is(err, ErrOutsideSearchPaths) {
+		t.Fatalf("ExtractTailUsageFromSearchPaths outside root error = %v, want ErrOutsideSearchPaths", err)
+	}
+	if _, err := ExtractUsageSinceFromSearchPaths([]string{root}, outside, ""); !errors.Is(err, ErrOutsideSearchPaths) {
+		t.Fatalf("ExtractUsageSinceFromSearchPaths outside root error = %v, want ErrOutsideSearchPaths", err)
 	}
 
 	inside := filepath.Join(root, "session.jsonl")
@@ -531,7 +535,7 @@ func TestExtractTailUsageSinceStopsAtGrowthCap(t *testing.T) {
 
 	// ~600KB of transcript against a 128KB cap: the loop must exit through the
 	// cap with the cursor still unreached.
-	got, err := extractTailUsageSince(path, "msg_does_not_exist", 128*1024)
+	got, err := extractTailUsageSince(path, "msg_does_not_exist", 128*1024, false)
 	if err != nil {
 		t.Fatalf("extractTailUsageSince: %v", err)
 	}
@@ -605,5 +609,81 @@ func TestExtractTailUsageSinceSpansOversizedTranscriptLine(t *testing.T) {
 	}
 	if len(got) != 2*half {
 		t.Errorf("got %d invocations, want all %d spanning the oversized line", len(got), 2*half)
+	}
+}
+
+// TestExtractUsageSinceEmptyCursorReadsWholeTranscript pins the sweep-only
+// backfill: with no cursor, a transcript many tail windows long is read in
+// full, so a session whose first sweep comes late — a long-lived session at
+// deploy time, or a conversation that just replaced its predecessor — is
+// recorded from its first invocation rather than from the last 64KB.
+func TestExtractUsageSinceEmptyCursorReadsWholeTranscript(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+
+	const entries = 60 // ~1.2MB, ~19 tail windows
+	rows := make([]map[string]any, 0, entries)
+	for i := range entries {
+		rows = append(rows, buildUsageEntry(fmt.Sprintf("msg_%02d", i)))
+	}
+	writeTailJSONL(t, path, rows)
+
+	fixed, err := ExtractTailUsageSince(path, "")
+	if err != nil {
+		t.Fatalf("ExtractTailUsageSince: %v", err)
+	}
+	if len(fixed) >= entries {
+		t.Fatalf("test is not exercising the defect: the fixed window already holds all %d entries", entries)
+	}
+	got, err := ExtractUsageSince(path, "")
+	if err != nil {
+		t.Fatalf("ExtractUsageSince: %v", err)
+	}
+	if len(got) != entries {
+		t.Fatalf("got %d invocations, want all %d", len(got), entries)
+	}
+	if got[0].MessageID != "msg_00" || got[entries-1].MessageID != fmt.Sprintf("msg_%02d", entries-1) {
+		t.Errorf("order/identity wrong: first=%q last=%q", got[0].MessageID, got[entries-1].MessageID)
+	}
+}
+
+// TestExtractUsageSinceBackfillStopsAtGrowthCap pins that the whole-file
+// backfill is still bounded by the growth cap.
+func TestExtractUsageSinceBackfillStopsAtGrowthCap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+
+	const entries = 30
+	rows := make([]map[string]any, 0, entries)
+	for i := range entries {
+		rows = append(rows, buildUsageEntry(fmt.Sprintf("msg_%02d", i)))
+	}
+	writeTailJSONL(t, path, rows)
+
+	got, err := extractTailUsageSince(path, "", 128*1024, true)
+	if err != nil {
+		t.Fatalf("extractTailUsageSince: %v", err)
+	}
+	if len(got) == 0 || len(got) >= entries {
+		t.Fatalf("got %d of %d entries; want the cap-bounded widest window", len(got), entries)
+	}
+}
+
+// TestExtractTailUsageCarriesRequestID pins that the provider request id rides
+// along with the message id, so consumers can deduplicate one billed API call
+// on (message id, request id) across transcripts.
+func TestExtractTailUsageCarriesRequestID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	row := buildUsageEntry("msg_01")
+	row["requestId"] = "req_01"
+	writeTailJSONL(t, path, []map[string]any{row})
+
+	got, err := ExtractUsageSince(path, "")
+	if err != nil {
+		t.Fatalf("ExtractUsageSince: %v", err)
+	}
+	if len(got) != 1 || got[0].RequestID != "req_01" {
+		t.Fatalf("got %+v, want one usage carrying RequestID req_01", got)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/gastownhall/gascity/internal/pathutil"
 )
+
+// ErrOutsideSearchPaths reports a session log path that does not resolve under
+// any configured search root. It persists until the path or the search-path
+// configuration changes, so retrying the same read cannot succeed.
+var ErrOutsideSearchPaths = errors.New("session log path is outside configured search paths")
 
 // TailMeta holds metadata extracted from the tail of a session file.
 type TailMeta struct {
@@ -88,7 +94,7 @@ func validateSearchPathFile(searchPaths []string, path string) (string, error) {
 		}
 		return cleanPath, nil
 	}
-	return "", fmt.Errorf("session log path is outside configured search paths")
+	return "", ErrOutsideSearchPaths
 }
 
 // readTail reads the last tailChunkSize bytes of r (or the whole thing if smaller).
@@ -188,6 +194,7 @@ type tailEntry struct {
 	Type      string          `json:"type"`
 	Subtype   string          `json:"subtype,omitempty"`
 	UUID      string          `json:"uuid"`
+	RequestID string          `json:"requestId,omitempty"`
 	Message   json.RawMessage `json:"message"`
 	Timestamp tailTime        `json:"timestamp"`
 }

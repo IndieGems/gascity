@@ -139,6 +139,31 @@ func TestBuildUsageBodySkipsInvalidFactsAndKeepsSessionIDsDistinct(t *testing.T)
 	}
 }
 
+func TestBuildUsageBodyCountsEachModelCallOnce(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	at := now.Add(-time.Minute).UnixMilli()
+	facts := []usage.Fact{
+		{Kind: usage.KindModel, Worker: "rig/worker-a", SessionID: "s-1", UpstreamReqID: "msg-1", RequestID: "req-1", InputTokens: 10, CostUSDEstimate: 0.5, At: at, IdempotencyKey: "run-a:msg-1"},
+		// The same billed call recorded again under another run.
+		{Kind: usage.KindModel, Worker: "rig/worker-a", SessionID: "s-1", UpstreamReqID: "msg-1", RequestID: "req-1", InputTokens: 10, CostUSDEstimate: 0.5, At: at, IdempotencyKey: "run-b:msg-1"},
+		// Same message id, different request: a distinct billed call.
+		{Kind: usage.KindModel, Worker: "rig/worker-a", SessionID: "s-1", UpstreamReqID: "msg-1", RequestID: "req-2", InputTokens: 20, CostUSDEstimate: 1, At: at, IdempotencyKey: "run-a:msg-1:req-2"},
+		// No upstream id: never collapsed.
+		{Kind: usage.KindModel, Worker: "rig/worker-a", SessionID: "s-1", InputTokens: 40, At: at, IdempotencyKey: "anon-1"},
+		{Kind: usage.KindModel, Worker: "rig/worker-a", SessionID: "s-1", InputTokens: 40, At: at, IdempotencyKey: "anon-2"},
+	}
+	body := buildUsageBody(facts, usage.RecentReadReport{}, now)
+	if body.Today.InputTokens != 110 || body.Today.Invocations != 4 || body.Today.CostUSDEstimate != 1.5 {
+		t.Fatalf("today = %+v, want each billed call once (in=110 calls=4 cost=1.5)", body.Today)
+	}
+	if body.Recent.InputTokens != 110 {
+		t.Fatalf("recent input = %d, want 110", body.Recent.InputTokens)
+	}
+	if len(body.RecentBySession) != 1 || body.RecentBySession[0].InputTokens != 110 {
+		t.Fatalf("recent_by_session = %+v, want one session with 110 input tokens", body.RecentBySession)
+	}
+}
+
 func TestHandleUsageIsRegisteredAndReturnsSanitizedAggregate(t *testing.T) {
 	state := newFakeState(t)
 	state.usageSink = usage.NewLocalSink(filepath.Join(state.cityPath, ".gc", "usage.jsonl"))

@@ -38,7 +38,7 @@ gc [flags]
 | [gc context](#gc-context) | Manage named remote cities (~/.gc/contexts.toml) |
 | [gc converge](#gc-converge) | Manage convergence loops (bounded iterative refinement) |
 | [gc convoy](#gc-convoy) | Manage convoys — graphs of related work |
-| [gc costs](#gc-costs) | Show per-run usage and estimated cost for this city |
+| [gc costs](#gc-costs) | Show usage and estimated cost for this city by run, day, agent, or model |
 | [gc dashboard](#gc-dashboard) | Open the web dashboard in your browser |
 | [gc doctor](#gc-doctor) | Check workspace health |
 | [gc dolt-cleanup](#gc-dolt-cleanup) | Find and remove orphaned Dolt databases (Go-side core) |
@@ -1346,26 +1346,42 @@ gc convoy target <convoy-id> <branch> [flags]
 ## gc costs
 
 Aggregate recorded usage facts (model tokens and compute wall-seconds)
-by run for local cost insight.
+for local cost insight, grouped by run (default), UTC day, agent, or model,
+with a total for the window.
 
-Reads .gc/usage.jsonl (the local usage sink) and groups facts by run id. This
-reflects facts only under the default "local" usage provider; with an "exec:"
-or "discard" provider the facts are forwarded out of process or dropped, so
-gc costs shows nothing local.
+Reads .gc/usage.jsonl (the local usage sink). This reflects facts only under the
+default "local" usage provider; with an "exec:" or "discard" provider the facts
+are forwarded out of process or dropped, so gc costs shows nothing local.
+
+The controller records one model fact per API call from every session's
+provider transcript, subagent transcripts included, while the session runs and
+when it stops. A call recorded more than once (the same provider message and
+request id) is counted once. --by agent groups by the configured agent the
+session ran, so every pool slot of one agent rolls up together.
 
 Cost is a list-price estimate for decision support, not an authoritative
 charge; invocations with no pricing are flagged "unpriced" and excluded from
 the cost total.
 
 ```
-gc costs
+gc costs [flags]
 ```
 
 **Example:**
 
 ```
 gc costs
+gc costs --since 24h --by agent
+gc costs --since 7d --by day
+gc costs --since 2026-10-02T00:00:00Z --until 2026-10-03T00:00:00Z --by model --json
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--by` | string | `run` | group rows by run, day, agent, or model |
+| `--json` | bool |  | emit JSON instead of a table |
+| `--since` | string |  | start of the window — duration (24h, 7d) or RFC3339 timestamp (default: all recorded usage) |
+| `--until` | string |  | end of the window — duration ago (0s = now) or RFC3339 timestamp (default: now) |
 
 ## gc dashboard
 

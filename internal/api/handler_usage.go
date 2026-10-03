@@ -152,7 +152,9 @@ func buildUsageBody(facts []usage.Fact, report usage.RecentReadReport, now time.
 	var today, last24h, recent usage.Totals
 	var oldest time.Time
 	invalid := 0
-	for _, fact := range facts {
+	// Count each billed API call once, as gc costs does: a call recorded under
+	// two runs carries two IdempotencyKeys, so ReadFacts keeps both.
+	for _, fact := range usage.DedupeModelCalls(facts) {
 		if !validUsageFact(fact, now) {
 			invalid++
 			continue

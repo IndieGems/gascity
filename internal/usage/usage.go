@@ -45,6 +45,7 @@ type Fact struct {
 	SessionID string `json:"session_id,omitempty"` // the session bead id: join key to manifold spend (EIA session_id) and recall transcripts
 	StepID    string `json:"step_id,omitempty"`    // the acting work bead id, if any
 	Worker    string `json:"worker,omitempty"`     // session name
+	Agent     string `json:"agent,omitempty"`      // configured agent (template) the session runs: the per-role rollup key
 	City      string `json:"city,omitempty"`
 
 	Kind Kind `json:"kind"`
@@ -68,7 +69,12 @@ type Fact struct {
 
 	// UpstreamReqID is the provider response id (Anthropic message.id / OpenAI
 	// response.id) for model facts, or sessionID+awakeEpoch for compute facts.
-	UpstreamReqID  string `json:"upstream_req_id,omitempty"`
+	UpstreamReqID string `json:"upstream_req_id,omitempty"`
+	// RequestID is the provider API request id (Anthropic requestId, req_*) for
+	// model facts, when the transcript carries one. With UpstreamReqID it
+	// identifies one billed API call regardless of which run or transcript it
+	// was recorded under; see [DedupeModelCalls].
+	RequestID      string `json:"request_id,omitempty"`
 	At             int64  `json:"at,omitempty"`              // unix millis, stamped by the emitter
 	IdempotencyKey string `json:"idempotency_key,omitempty"` // see ModelIdempotencyKey / ComputeIdempotencyKey
 }
@@ -88,6 +94,62 @@ var Discard Sink = discardSink{}
 type discardSink struct{}
 
 func (discardSink) Record(context.Context, Fact) error { return nil }
+
+// BatchSink is an optional [Sink] extension that records several facts as one
+// durable write. [RecordAll] uses it when available.
+type BatchSink interface {
+	Sink
+	// RecordBatch records facts as one durable write. On error the caller must
+	// retry the whole batch; a prefix may already be durable and is collapsed
+	// by IdempotencyKey.
+	RecordBatch(ctx context.Context, facts []Fact) error
+}
+
+// RecordAll records facts in order, as one durable write when sink implements
+// [BatchSink] and one Record per fact otherwise. It returns how many leading
+// facts are known recorded: on a per-fact sink it stops at the first failure
+// and returns the count before it; on a batch sink it reports all or none.
+func RecordAll(ctx context.Context, sink Sink, facts []Fact) (int, error) {
+	if len(facts) == 0 {
+		return 0, nil
+	}
+	if bs, ok := sink.(BatchSink); ok {
+		if err := bs.RecordBatch(ctx, facts); err != nil {
+			return 0, err
+		}
+		return len(facts), nil
+	}
+	for i, f := range facts {
+		if err := sink.Record(ctx, f); err != nil {
+			return i, err
+		}
+	}
+	return len(facts), nil
+}
+
+// DedupeModelCalls collapses model facts that account for the same billed API
+// call — the same (UpstreamReqID, RequestID) pair — keeping the first
+// occurrence and preserving input order. It complements the read-time
+// IdempotencyKey collapse in [ReadFacts], whose key also folds in the run id: a
+// call recorded under two runs, or from two transcripts that both carry it (a
+// forked or replayed conversation), would otherwise be counted twice. Model
+// facts without an UpstreamReqID, and every compute fact, pass through.
+func DedupeModelCalls(facts []Fact) []Fact {
+	type callKey struct{ message, request string }
+	seen := make(map[callKey]struct{}, len(facts))
+	out := make([]Fact, 0, len(facts))
+	for _, f := range facts {
+		if f.Kind == KindModel && f.UpstreamReqID != "" {
+			k := callKey{message: f.UpstreamReqID, request: f.RequestID}
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+		}
+		out = append(out, f)
+	}
+	return out
+}
 
 // ModelIdempotencyKey is the natural per-response key for a model fact: the run
 // plus the provider response id (Anthropic message.id / OpenAI response.id, or a

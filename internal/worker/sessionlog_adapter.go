@@ -134,6 +134,14 @@ func (a SessionLogAdapter) TailUsage(path, cursorID string) ([]sessionlog.TailUs
 	return sessionlog.ExtractTailUsageSinceFromSearchPaths(a.SearchPaths, path, cursorID)
 }
 
+// UsageSince reads per-invocation token usage from a Claude transcript the
+// caller owns outright: like TailUsage, except an empty cursorID reads the whole
+// transcript (bounded by the extractor's growth cap) rather than the last tail
+// window. The controller's model-usage sweep uses it.
+func (a SessionLogAdapter) UsageSince(path, cursorID string) ([]sessionlog.TailUsage, error) {
+	return sessionlog.ExtractUsageSinceFromSearchPaths(a.SearchPaths, path, cursorID)
+}
+
 // CodexTailUsage reads per-invocation token usage from the tail of a codex
 // rollout transcript. Validation merges the codex default roots
 // (~/.codex/sessions) on top of the configured search paths, because

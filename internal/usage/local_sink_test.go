@@ -261,3 +261,25 @@ func TestReadFactsKeepsValidUnterminatedFinalLine(t *testing.T) {
 func pad(i int) string {
 	return string(rune('0'+i/10)) + string(rune('0'+i%10))
 }
+
+func TestLocalSinkRecordBatchRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.jsonl")
+	s := NewLocalSink(path)
+	batch := []Fact{
+		{Kind: KindModel, IdempotencyKey: "k1", UpstreamReqID: "msg_1", RequestID: "req_1", Agent: "mayor"},
+		{Kind: KindModel, IdempotencyKey: "k2", UpstreamReqID: "msg_2", RequestID: "req_2"},
+	}
+	if err := s.RecordBatch(context.Background(), batch); err != nil {
+		t.Fatalf("RecordBatch: %v", err)
+	}
+	if err := s.RecordBatch(context.Background(), nil); err != nil {
+		t.Fatalf("RecordBatch(nil): %v", err)
+	}
+	got, warnings, err := ReadFacts(path)
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("ReadFacts: err=%v warnings=%v", err, warnings)
+	}
+	if len(got) != 2 || got[0].RequestID != "req_1" || got[0].Agent != "mayor" || got[1].UpstreamReqID != "msg_2" {
+		t.Fatalf("round trip wrong: %+v", got)
+	}
+}

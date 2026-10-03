@@ -42,12 +42,29 @@ func IsLocalSink(sink Sink) bool {
 }
 
 // Record appends f to the underlying file and fsyncs before returning.
-func (s *LocalSink) Record(_ context.Context, f Fact) error {
-	line, err := json.Marshal(f)
-	if err != nil {
-		return err
+func (s *LocalSink) Record(ctx context.Context, f Fact) error {
+	return s.RecordBatch(ctx, []Fact{f})
+}
+
+// RecordBatch appends every fact in facts with a single write and a single
+// fsync, so a sweep that recovers a long transcript does not pay one
+// open/fsync/close per invocation. A failed batch may leave a prefix (or a torn
+// tail) on disk; the caller retries the whole batch and [ReadFacts] collapses
+// the overlap by IdempotencyKey.
+func (s *LocalSink) RecordBatch(_ context.Context, facts []Fact) error {
+	if len(facts) == 0 {
+		return nil
 	}
-	line = append(line, '\n')
+	var buf []byte
+	for _, f := range facts {
+		line, err := json.Marshal(f)
+		if err != nil {
+			return err
+		}
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+	}
+	line := buf
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

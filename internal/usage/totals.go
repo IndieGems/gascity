@@ -7,15 +7,15 @@ import (
 // Totals is the canonical accumulation of usage facts shared by the CLI and
 // HTTP telemetry surfaces.
 type Totals struct {
-	Invocations         int
-	ComputeFacts        int
-	InputTokens         int
-	OutputTokens        int
-	CacheReadTokens     int
-	CacheCreationTokens int
-	WallSeconds         float64
-	CostUSDEstimate     float64
-	Unpriced            int
+	Invocations         int     `json:"invocations"`
+	ComputeFacts        int     `json:"compute_facts"`
+	InputTokens         int     `json:"input_tokens"`
+	OutputTokens        int     `json:"output_tokens"`
+	CacheReadTokens     int     `json:"cache_read_tokens"`
+	CacheCreationTokens int     `json:"cache_creation_tokens"`
+	WallSeconds         float64 `json:"wall_seconds"`
+	CostUSDEstimate     float64 `json:"cost_usd_estimate"`
+	Unpriced            int     `json:"unpriced_invocations"`
 }
 
 // Add folds one fact into the totals. Unpriced facts retain their token volume
