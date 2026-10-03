@@ -36,15 +36,18 @@ func TestSendNudgeTextTypesSemicolonsIntoRealPane(t *testing.T) {
 			tm := NewTmuxWithConfig(cfg)
 			t.Cleanup(func() { _, _ = tm.run("kill-server") })
 
-			out := filepath.Join(t.TempDir(), "typed")
-			if _, err := tm.run("new-session", "-d", "-s", "semi", "stty -echo; cat > "+shellQuote(out)); err != nil {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "typed")
+			ready := filepath.Join(dir, "ready")
+			if _, err := tm.run("new-session", "-d", "-s", "semi", "stty -echo; echo ready > "+shellQuote(ready)+"; cat > "+shellQuote(out)); err != nil {
 				t.Skipf("cannot create tmux session: %v", err)
 			}
 			if err := tm.SetEnvironment("semi", "GC_PROVIDER", "claude"); err != nil {
 				t.Fatalf("SetEnvironment: %v", err)
 			}
-			// Let the shell run stty before the first keystroke reaches the tty.
-			time.Sleep(300 * time.Millisecond)
+			// The shell has run stty once it writes the ready marker; the tty
+			// buffers any keystrokes typed before cat starts reading.
+			waitForFileContents(t, ready, 5*time.Second)
 
 			if err := tm.sendNudgeTextWithRetry("semi", text, 5*time.Second); err != nil {
 				t.Fatalf("sendNudgeTextWithRetry() = %v, want nil", err)
@@ -56,18 +59,31 @@ func TestSendNudgeTextTypesSemicolonsIntoRealPane(t *testing.T) {
 			}
 			want := text + "\n"
 
-			var got []byte
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				got, _ = os.ReadFile(out)
-				if len(got) >= len(want) {
-					break
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
+			got := waitForFileBytes(t, out, len(want), 5*time.Second)
 			if string(got) != want {
 				t.Fatalf("pane received %d of %d bytes; missing ';' = %d", len(got), len(want), strings.Count(want, ";")-strings.Count(string(got), ";"))
 			}
 		})
+	}
+}
+
+// waitForFileBytes returns the contents of path once it holds at least n
+// bytes, or whatever it holds when timeout expires.
+func waitForFileBytes(t *testing.T, path string, n int, timeout time.Duration) []byte {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		got, _ := os.ReadFile(path)
+		if len(got) >= n {
+			return got
+		}
+		select {
+		case <-timer.C:
+			return got
+		case <-ticker.C:
+		}
 	}
 }
