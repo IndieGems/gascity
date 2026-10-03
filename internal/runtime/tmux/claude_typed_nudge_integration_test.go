@@ -10,19 +10,25 @@ import (
 	"time"
 )
 
-// TestSendNudgeTextTypesSemicolonAtBurstCutIntoRealPane types Claude-bound
-// text into a real, isolated tmux server whose pane copies its input to a
-// file. A ';' that ends a burst is a tmux command separator, so before the
-// cut moved back the pane received every byte but that ';'.
-func TestSendNudgeTextTypesSemicolonAtBurstCutIntoRealPane(t *testing.T) {
+// TestSendNudgeTextTypesSemicolonsIntoRealPane types Claude-bound text into a
+// real, isolated tmux server whose pane copies its input to a file. tmux reads
+// a send-keys argument ending in ';' as a command separator and drops the ';',
+// so a burst that ended in one -- at a cut or at the end of the text -- used to
+// reach the pane without it.
+func TestSendNudgeTextTypesSemicolonsIntoRealPane(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
 	}
 
 	for name, text := range map[string]string{
-		"semicolon at cut": strings.Repeat("x", 639) + ";" + strings.Repeat("y", 200) + "\n",
+		"semicolon at cut": strings.Repeat("x", claudeMaxTypedBurstBytes-1) + ";" + strings.Repeat("y", 200) + "\n",
 		"semicolon run":    strings.Repeat("x", claudeMaxTypedBurstBytes-3) + ";;;" + strings.Repeat("y", 200) + "\n",
-		"all semicolons":   strings.Repeat(";", claudeMaxTypedBurstBytes+50) + "z\n",
+		"all semicolons":   strings.Repeat(";", claudeMaxTypedBurstBytes+50),
+		"ends in ;":        strings.Repeat("x", 500) + ";",
+		"ends in ;;;":      strings.Repeat("x", 500) + ";;;",
+		"short ends in ;":  "hello;",
+		"lone ;":           ";",
+		"backslash ;":      `path\;`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := DefaultConfig()
@@ -43,18 +49,24 @@ func TestSendNudgeTextTypesSemicolonAtBurstCutIntoRealPane(t *testing.T) {
 			if err := tm.sendNudgeTextWithRetry("semi", text, 5*time.Second); err != nil {
 				t.Fatalf("sendNudgeTextWithRetry() = %v, want nil", err)
 			}
+			// Submit like a nudge does; the tty holds an unterminated line
+			// back from cat until Enter.
+			if _, err := tm.run("send-keys", "-t", "semi", "Enter"); err != nil {
+				t.Fatalf("send-keys Enter: %v", err)
+			}
+			want := text + "\n"
 
 			var got []byte
 			deadline := time.Now().Add(5 * time.Second)
 			for time.Now().Before(deadline) {
 				got, _ = os.ReadFile(out)
-				if len(got) >= len(text) {
+				if len(got) >= len(want) {
 					break
 				}
 				time.Sleep(50 * time.Millisecond)
 			}
-			if string(got) != text {
-				t.Fatalf("pane received %d of %d bytes; missing ';' = %d", len(got), len(text), strings.Count(text, ";")-strings.Count(string(got), ";"))
+			if string(got) != want {
+				t.Fatalf("pane received %d of %d bytes; missing ';' = %d", len(got), len(want), strings.Count(want, ";")-strings.Count(string(got), ";"))
 			}
 		})
 	}

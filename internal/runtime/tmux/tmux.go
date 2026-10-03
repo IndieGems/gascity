@@ -2266,10 +2266,6 @@ func splitPasteText(text string, maxBytes int) []string {
 		if newline := strings.LastIndexByte(text[:cut], '\n'); newline >= 0 {
 			cut = newline + 1
 		}
-		cut = semicolonSafeCut(text, cut)
-		if cut == len(text) {
-			break
-		}
 		chunks = append(chunks, text[:cut])
 		text = text[cut:]
 	}
@@ -2277,32 +2273,6 @@ func splitPasteText(text string, maxBytes int) []string {
 		chunks = append(chunks, text)
 	}
 	return chunks
-}
-
-// semicolonSafeCut moves cut so the chunk text[:cut] does not end in ';'.
-// tmux reads a send-keys argument ending in ';' as a command separator and
-// drops the ';', even after -l --, so a chunk typed that way would lose it.
-// The cut moves back so the ';' run starts the next chunk. When the chunk is
-// nothing but ';', it instead extends past the run and the rune after it,
-// keeping the run whole; a run reaching the end of text returns len(text) so
-// the caller keeps it in the final chunk.
-func semicolonSafeCut(text string, cut int) int {
-	back := cut
-	for back > 0 && text[back-1] == ';' {
-		back--
-	}
-	if back > 0 {
-		return back
-	}
-	end := cut
-	for end < len(text) && text[end] == ';' {
-		end++
-	}
-	if end == len(text) {
-		return end
-	}
-	_, size := utf8.DecodeRuneInString(text[end:])
-	return end + size
 }
 
 func sendPasteChunks(chunks []string, send func(string) error, pause func()) error {

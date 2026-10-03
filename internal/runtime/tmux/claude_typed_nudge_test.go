@@ -3,6 +3,7 @@ package tmux
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,18 +32,69 @@ func (e *providerPaneExecutor) executeCtx(_ context.Context, args []string) (str
 	return e.execute(args)
 }
 
-// literalSends returns the text of every `send-keys -l` call, in order.
+// sendKeysCommands returns every send-keys command, in order. One tmux
+// invocation can chain several commands with a lone ";" argument.
+func (e *providerPaneExecutor) sendKeysCommands() [][]string {
+	var out [][]string
+	for _, c := range e.calls {
+		for len(c) > 0 {
+			end := slices.Index(c, ";")
+			if end < 0 {
+				end = len(c)
+			}
+			if cmd := c[:end]; slices.Contains(cmd, "send-keys") {
+				out = append(out, cmd)
+			}
+			c = c[min(end+1, len(c)):]
+		}
+	}
+	return out
+}
+
+// literalSends returns the text of every `send-keys -l` command, in order.
 func (e *providerPaneExecutor) literalSends() []string {
 	var out []string
-	for _, c := range e.calls {
-		if !slices.Contains(c, "send-keys") {
-			continue
-		}
-		if i := slices.Index(c, "-l"); i >= 0 {
+	for _, c := range e.sendKeysCommands() {
+		if slices.Contains(c, "-l") {
 			out = append(out, c[len(c)-1])
 		}
 	}
 	return out
+}
+
+// typedText returns what the pane receives from every send-keys -l and -H
+// command, in order.
+func (e *providerPaneExecutor) typedText(t *testing.T) string {
+	t.Helper()
+	var b strings.Builder
+	for _, c := range e.sendKeysCommands() {
+		switch {
+		case slices.Contains(c, "-l"):
+			b.WriteString(c[len(c)-1])
+		case slices.Contains(c, "-H"):
+			for _, key := range c[slices.Index(c, "-H")+1:] {
+				n, err := strconv.ParseUint(key, 16, 8)
+				if err != nil {
+					t.Fatalf("send-keys -H key %q is not a hex byte: %v", key, err)
+				}
+				b.WriteByte(byte(n))
+			}
+		}
+	}
+	return b.String()
+}
+
+// assertNoTmuxStrippedSemicolon fails when a send-keys argument ends in ';',
+// which tmux reads as a command separator and drops, even after -l --.
+func (e *providerPaneExecutor) assertNoTmuxStrippedSemicolon(t *testing.T) {
+	t.Helper()
+	for _, c := range e.sendKeysCommands() {
+		for _, arg := range c {
+			if strings.HasSuffix(arg, ";") {
+				t.Fatalf("send-keys %q has an argument ending in ';', which tmux strips", c)
+			}
+		}
+	}
 }
 
 func (e *providerPaneExecutor) commandCount(name string) int {
@@ -88,7 +140,7 @@ func TestSendNudgeTextTypesLongClaudeTextBelowPasteThreshold(t *testing.T) {
 		if len(sends) < 2 {
 			t.Fatalf("size %d: literal sends = %d, want the text split into several bursts", size, len(sends))
 		}
-		for _, c := range ex.calls {
+		for _, c := range ex.sendKeysCommands() {
 			if !slices.Contains(c, "-l") {
 				continue
 			}
@@ -120,7 +172,7 @@ func TestSendNudgeTextSendsShortClaudeTextAsOneBurst(t *testing.T) {
 	if len(sends) != 1 || sends[0] != text {
 		t.Fatalf("literal sends = %q, want the whole text in one burst", sends)
 	}
-	for _, c := range ex.calls {
+	for _, c := range ex.sendKeysCommands() {
 		if slices.Contains(c, "-l") && c[len(c)-2] != "--" {
 			t.Fatalf("send-keys %q does not end options with --; text starting with '-' is read as a flag", c)
 		}
@@ -187,73 +239,46 @@ func TestNudgeSessionTypesLongClaudeNudgeWithoutPasting(t *testing.T) {
 	}
 }
 
-// assertNoInteriorSemicolonCut fails when any chunk but the last ends in ';'.
-// tmux reads a send-keys argument ending in ';' as a command separator and
-// drops the ';', so such a cut would silently lose a character.
-func assertNoInteriorSemicolonCut(t *testing.T, text string, chunks []string) {
-	t.Helper()
-	if got := strings.Join(chunks, ""); got != text {
-		t.Fatalf("joined chunks = %q, want %q", got, text)
-	}
-	for i, chunk := range chunks[:len(chunks)-1] {
-		if chunk == "" {
-			t.Fatalf("chunk %d is empty: %q", i, chunks)
-		}
-		if strings.HasSuffix(chunk, ";") {
-			t.Fatalf("chunk %d = %q ends in ';', which tmux strips: %q", i, chunk, chunks)
-		}
-	}
-}
+func TestSendNudgeTextTypesTrailingSemicolonsAsHexKeys(t *testing.T) {
+	for name, text := range map[string]string{
+		"short text ending in semicolon": "hello;",
+		"lone semicolon":                 ";",
+		"backslash before semicolon":     `path\;`,
+		"semicolon at burst cut":         strings.Repeat("x", claudeMaxTypedBurstBytes-1) + ";" + strings.Repeat("y", 200) + "\n",
+		"semicolon run at burst cut":     strings.Repeat("x", claudeMaxTypedBurstBytes-3) + ";;;" + strings.Repeat("y", 200) + "\n",
+		"semicolon run ending the text":  strings.Repeat("x", 500) + ";;;",
+		"all semicolons":                 strings.Repeat(";", claudeMaxTypedBurstBytes+50),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ex := &providerPaneExecutor{provider: "claude"}
+			tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
-func TestSplitPasteTextMovesCutBeforeSemicolon(t *testing.T) {
-	text := "abcd;efghij"
-	chunks := splitPasteText(text, 5)
+			if err := tm.sendNudgeTextWithRetry("%1", text, 3*time.Second); err != nil {
+				t.Fatalf("sendNudgeTextWithRetry() = %v, want nil", err)
+			}
 
-	assertNoInteriorSemicolonCut(t, text, chunks)
-	if want := []string{"abcd", ";efgh", "ij"}; !slices.Equal(chunks, want) {
-		t.Fatalf("chunks = %q, want %q", chunks, want)
+			ex.assertNoTmuxStrippedSemicolon(t)
+			if got := ex.typedText(t); got != text {
+				t.Fatalf("typed text = %q, want %q", got, text)
+			}
+		})
 	}
 }
 
-func TestSplitPasteTextMovesCutBeforeSemicolonRun(t *testing.T) {
-	text := "ab;;;cdefgh"
-	chunks := splitPasteText(text, 5)
-
-	assertNoInteriorSemicolonCut(t, text, chunks)
-	if want := []string{"ab", ";;;cd", "efgh"}; !slices.Equal(chunks, want) {
-		t.Fatalf("chunks = %q, want %q", chunks, want)
-	}
-}
-
-func TestSplitPasteTextKeepsAllSemicolonTextInFinalBurst(t *testing.T) {
-	text := strings.Repeat(";", 12)
-	chunks := splitPasteText(text, 5)
-
-	if want := []string{text}; !slices.Equal(chunks, want) {
-		t.Fatalf("chunks = %q, want the whole run as the final burst %q", chunks, want)
-	}
-}
-
-func TestSplitPasteTextCarriesOversizedSemicolonRunPastTheRun(t *testing.T) {
-	text := ";;;;;;;é;;xyz"
-	chunks := splitPasteText(text, 5)
-
-	assertNoInteriorSemicolonCut(t, text, chunks)
-	if want := []string{";;;;;;;é", ";;xyz"}; !slices.Equal(chunks, want) {
-		t.Fatalf("chunks = %q, want %q", chunks, want)
-	}
-}
-
-func TestSendNudgeTextNeverEndsAClaudeBurstInSemicolon(t *testing.T) {
+func TestSendTypedLiteralTextUsesOneTmuxInvocationPerBurst(t *testing.T) {
 	ex := &providerPaneExecutor{provider: "claude"}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
-	text := strings.Repeat("x", claudeMaxTypedBurstBytes-1) + ";" + strings.Repeat("y", 200) + "\n"
 
-	if err := tm.sendNudgeTextWithRetry("%1", text, 3*time.Second); err != nil {
-		t.Fatalf("sendNudgeTextWithRetry() = %v, want nil", err)
+	if err := tm.sendTypedLiteralText("%1", `a\;;`); err != nil {
+		t.Fatalf("sendTypedLiteralText() = %v, want nil", err)
 	}
 
-	assertNoInteriorSemicolonCut(t, text, ex.literalSends())
+	// A retry resends the whole burst, so its text and its ';' keys must go
+	// out in one tmux call or a retry after a partial send would double text.
+	want := [][]string{{"-u", "send-keys", "-t", "%1", "-l", "--", `a\`, ";", "send-keys", "-t", "%1", "-H", "3b", "3b"}}
+	if !slices.EqualFunc(ex.calls, want, slices.Equal[[]string]) {
+		t.Fatalf("tmux calls = %q, want %q", ex.calls, want)
+	}
 }
 
 func TestClaudeTypedBurstPairStaysBelowPasteThreshold(t *testing.T) {

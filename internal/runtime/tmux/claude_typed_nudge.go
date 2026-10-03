@@ -23,6 +23,8 @@ const (
 	// claudeTypedBurstDelay separates bursts so the pty does not hand Claude
 	// Code two of them in one read.
 	claudeTypedBurstDelay = 100 * time.Millisecond
+	// semicolonHexKey is ';' as a send-keys -H key.
+	semicolonHexKey = "3b"
 )
 
 // claudeTypedTextReplacer applies the normalization Claude Code's own paste
@@ -53,7 +55,27 @@ func (t *Tmux) isClaudeTarget(target string) bool {
 
 // sendTypedLiteralText types text into target as keystrokes. The "--" ends
 // option parsing so a burst that begins with "-" is not read as a flag.
+//
+// tmux reads an argument ending in ';' as a command separator and drops that
+// ';', even after -l --, and its "\;" escape eats a backslash before it. A
+// trailing ';' run is therefore typed as hex keys by a second send-keys in the
+// same tmux invocation, so a retry never resends half a burst.
 func (t *Tmux) sendTypedLiteralText(target, text string) error {
-	_, err := t.run("send-keys", "-t", paneTarget(target), "-l", "--", text)
+	pane := paneTarget(target)
+	head := strings.TrimRight(text, ";")
+	var args []string
+	if head != "" || text == "" {
+		args = append(args, "send-keys", "-t", pane, "-l", "--", head)
+	}
+	if semicolons := len(text) - len(head); semicolons > 0 {
+		if len(args) > 0 {
+			args = append(args, ";")
+		}
+		args = append(args, "send-keys", "-t", pane, "-H")
+		for range semicolons {
+			args = append(args, semicolonHexKey)
+		}
+	}
+	_, err := t.run(args...)
 	return err
 }
