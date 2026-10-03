@@ -23,6 +23,11 @@ type TailUsage struct {
 	// duplicate token_count emissions). Empty when the transcript entry
 	// carries no collapse identity.
 	MessageID string
+	// RequestID is the provider API request id (Claude's top-level requestId,
+	// req_*) that produced the entry. Together with MessageID it is the
+	// cross-transcript identity of one billed API call. Empty when the
+	// transcript format carries none.
+	RequestID string
 	// Model is the provider model identifier that produced the entry.
 	Model string
 	// InputTokens is the non-cached prompt token count.
@@ -132,20 +137,33 @@ const maxUsageScanBytes = 16 * 1024 * 1024
 // backfilling a full transcript on first sight is not this function's job.
 // Callers may receive entries at or before the cursor and must still filter.
 func ExtractTailUsageSince(path, cursorID string) ([]TailUsage, error) {
-	return extractTailUsageSince(path, cursorID, maxUsageScanBytes)
+	return extractTailUsageSince(path, cursorID, maxUsageScanBytes, false)
+}
+
+// ExtractUsageSince is ExtractTailUsageSince for a caller that owns the whole
+// transcript: an empty cursorID reads the entire file (bounded by the same
+// maxUsageScanBytes growth cap) instead of a single tailChunkSize window. The
+// controller's model-usage sweep uses it, because it resolves a transcript by
+// the session's own provider key and so every invocation in the file belongs to
+// that session; reading only the tail on first sight would silently drop
+// everything a long-lived or freshly reset conversation did before the first
+// sweep. A non-empty cursorID behaves exactly like ExtractTailUsageSince.
+func ExtractUsageSince(path, cursorID string) ([]TailUsage, error) {
+	return extractTailUsageSince(path, cursorID, maxUsageScanBytes, true)
 }
 
 // extractTailUsageSince is ExtractTailUsageSince with the growth cap supplied
 // by the caller, so tests can drive the cap branch without building a
-// multi-megabyte transcript.
-func extractTailUsageSince(path, cursorID string, maxScanBytes int64) ([]TailUsage, error) {
+// multi-megabyte transcript. backfill makes an empty cursorID grow the window
+// to the whole file rather than stopping at the first tailChunkSize window.
+func extractTailUsageSince(path, cursorID string, maxScanBytes int64, backfill bool) ([]TailUsage, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close() //nolint:errcheck // best-effort close on read-only file
 
-	if cursorID == "" {
+	if cursorID == "" && !backfill {
 		data, _, err := readTail(f)
 		if err != nil {
 			return nil, err
@@ -164,7 +182,7 @@ func extractTailUsageSince(path, cursorID string, maxScanBytes int64) ([]TailUsa
 		}
 		// Reached the cursor, or the whole file is in view: nothing older can
 		// still be owed. Either way this window is complete.
-		if !truncated || containsCursor(usages, cursorID) {
+		if !truncated || (cursorID != "" && containsCursor(usages, cursorID)) {
 			return usages, nil
 		}
 		if window >= maxScanBytes {
@@ -223,6 +241,7 @@ func parseTailUsage(data []byte) ([]TailUsage, error) {
 		u := TailUsage{
 			EntryUUID:           entry.UUID,
 			MessageID:           msg.ID,
+			RequestID:           entry.RequestID,
 			Model:               msg.Model,
 			InputTokens:         msg.Usage.InputTokens,
 			OutputTokens:        msg.Usage.OutputTokens,
@@ -254,6 +273,16 @@ func ExtractTailUsageSinceFromSearchPaths(searchPaths []string, path, cursorID s
 		return nil, err
 	}
 	return ExtractTailUsageSince(safePath, cursorID)
+}
+
+// ExtractUsageSinceFromSearchPaths is ExtractUsageSince after verifying path
+// resolves under one of the configured session-log search roots.
+func ExtractUsageSinceFromSearchPaths(searchPaths []string, path, cursorID string) ([]TailUsage, error) {
+	safePath, err := validateSearchPathFile(searchPaths, path)
+	if err != nil {
+		return nil, err
+	}
+	return ExtractUsageSince(safePath, cursorID)
 }
 
 // ExtractTailUsageFromSearchPaths reads tail usage only after verifying

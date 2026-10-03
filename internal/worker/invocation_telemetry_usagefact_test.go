@@ -1624,16 +1624,14 @@ func TestFactorySweepRecoversBacklogBeyondFixedTailWindow(t *testing.T) {
 	}
 }
 
-// TestFactorySweepWithoutCursorMatchesFixedTailWindow pins the other half of
-// the per-family coverage ceiling documented on SweepSessionModelUsage: growth
-// is cursor-bounded, so before a cursor exists there is no growth at all.
-// ExtractTailUsageSince short-circuits to one fixed 64KB read, and the sweep
-// therefore emits only what that window holds — the pre-change behavior, with
-// no cap log. The cursor the sweep then persists points at the newest entry,
-// which is the growth loop's stop condition, so no later sweep reaches back
-// across the gap. TestFactorySweepRecoversBacklogBeyondFixedTailWindow
-// pre-seeds a cursor and so cannot cover this branch.
-func TestFactorySweepWithoutCursorMatchesFixedTailWindow(t *testing.T) {
+// TestFactorySweepWithoutCursorRecordsWholeTranscript pins that a session's
+// first sweep records its whole transcript, not just the last 64KB tail window.
+// The sweep resolves the transcript by the session's own provider key, so every
+// invocation in it belongs to the session; before, everything older than the
+// first window was dropped silently and the persisted cursor (the newest entry)
+// put that gap out of reach of every later sweep — which is how a long-lived
+// session first swept late lost most of its usage.
+func TestFactorySweepWithoutCursorRecordsWholeTranscript(t *testing.T) {
 	searchBase := t.TempDir()
 	workDir := t.TempDir()
 	sinkPath := filepath.Join(t.TempDir(), "usage.jsonl")
@@ -1698,8 +1696,8 @@ func TestFactorySweepWithoutCursorMatchesFixedTailWindow(t *testing.T) {
 		t.Fatalf("precondition: cursor = %q, want empty", got)
 	}
 
-	// The fixed window is what the sweep is expected to be limited to, and it
-	// must be genuinely narrower than the backlog or this asserts nothing.
+	// Guard: the fixed window is genuinely narrower than the backlog, so this
+	// test keeps exercising the first-sight loss rather than a tautology.
 	fixed, err := sessionlog.ExtractTailUsage(transcriptPath)
 	if err != nil {
 		t.Fatalf("ExtractTailUsage: %v", err)
@@ -1715,8 +1713,8 @@ func TestFactorySweepWithoutCursorMatchesFixedTailWindow(t *testing.T) {
 	if !settled {
 		t.Fatal("a fully-recorded sweep must report settled")
 	}
-	if emitted != len(fixed) {
-		t.Fatalf("emitted = %d, want %d (the fixed window only, with no cursor to grow toward)", emitted, len(fixed))
+	if emitted != backlog {
+		t.Fatalf("emitted = %d, want %d (the whole transcript)", emitted, backlog)
 	}
 
 	facts, warnings, err := usage.ReadFacts(sinkPath)
@@ -1726,18 +1724,21 @@ func TestFactorySweepWithoutCursorMatchesFixedTailWindow(t *testing.T) {
 	if len(warnings) != 0 {
 		t.Fatalf("unexpected sink warnings: %v", warnings)
 	}
-	if len(facts) != len(fixed) {
-		t.Fatalf("sink holds %d facts, want %d", len(facts), len(fixed))
+	if len(facts) != backlog {
+		t.Fatalf("sink holds %d facts, want %d", len(facts), backlog)
 	}
 
-	// The persisted cursor is the newest entry, not the oldest one the sweep
-	// missed: the gap below it is unreachable from every later sweep.
+	// The progress names the transcript the cursor points into, and the cursor
+	// is its newest entry.
 	after, err := store.Get(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCursor := fmt.Sprintf("msg-%02d", backlog-1)
-	if got := after.Metadata[sessionpkg.MetadataKeyInvocationUsageCursor]; got != wantCursor {
-		t.Fatalf("persisted cursor = %q, want %q (the newest entry)", got, wantCursor)
+	progress := sessionpkg.InvocationUsageProgressFromMetadata(after.Metadata)
+	if progress.Transcript != transcriptPath {
+		t.Fatalf("persisted transcript = %q, want %q", progress.Transcript, transcriptPath)
+	}
+	if want := fmt.Sprintf("msg-%02d", backlog-1); progress.Cursor != want {
+		t.Fatalf("persisted cursor = %q, want %q (the newest entry)", progress.Cursor, want)
 	}
 }

@@ -3,6 +3,7 @@ package usage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -91,5 +92,77 @@ func TestUnpricedFactKeepsTokensZeroCost(t *testing.T) {
 func TestDiscardSink(t *testing.T) {
 	if err := Discard.Record(context.Background(), Fact{Kind: KindModel}); err != nil {
 		t.Fatalf("Discard.Record must never error: %v", err)
+	}
+}
+
+func TestDedupeModelCallsCollapsesSameCallAcrossRuns(t *testing.T) {
+	facts := []Fact{
+		{Kind: KindModel, RunID: "run-a", UpstreamReqID: "msg_1", RequestID: "req_1", OutputTokens: 1},
+		{Kind: KindModel, RunID: "run-b", UpstreamReqID: "msg_1", RequestID: "req_1", OutputTokens: 1}, // same call, other run
+		{Kind: KindModel, RunID: "run-a", UpstreamReqID: "msg_1", RequestID: "req_2", OutputTokens: 1}, // distinct request
+		{Kind: KindModel, RunID: "run-a", UpstreamReqID: "msg_2", OutputTokens: 1},
+		{Kind: KindModel, RunID: "run-a", OutputTokens: 1}, // no identity: kept
+		{Kind: KindModel, RunID: "run-a", OutputTokens: 1},
+		{Kind: KindCompute, RunID: "run-a", WallSeconds: 1},
+	}
+	got := DedupeModelCalls(facts)
+	if len(got) != 6 {
+		t.Fatalf("got %d facts, want 6 (only the cross-run replay collapses): %+v", len(got), got)
+	}
+	if got[0].RunID != "run-a" || got[1].RequestID != "req_2" {
+		t.Fatalf("first occurrence must win and order must hold: %+v", got)
+	}
+}
+
+type countingSink struct {
+	recorded []Fact
+	failAt   int
+}
+
+func (s *countingSink) Record(_ context.Context, f Fact) error {
+	if s.failAt >= 0 && len(s.recorded) == s.failAt {
+		return errors.New("boom")
+	}
+	s.recorded = append(s.recorded, f)
+	return nil
+}
+
+type batchCountingSink struct {
+	countingSink
+	batches int
+	fail    bool
+}
+
+func (s *batchCountingSink) RecordBatch(_ context.Context, facts []Fact) error {
+	if s.fail {
+		return errors.New("boom")
+	}
+	s.batches++
+	s.recorded = append(s.recorded, facts...)
+	return nil
+}
+
+func TestRecordAll(t *testing.T) {
+	facts := []Fact{{IdempotencyKey: "a"}, {IdempotencyKey: "b"}, {IdempotencyKey: "c"}}
+	ctx := context.Background()
+
+	per := &countingSink{failAt: -1}
+	if n, err := RecordAll(ctx, per, facts); n != 3 || err != nil {
+		t.Fatalf("per-fact sink: n=%d err=%v", n, err)
+	}
+	partial := &countingSink{failAt: 2}
+	if n, err := RecordAll(ctx, partial, facts); n != 2 || err == nil {
+		t.Fatalf("per-fact sink failing at 2: n=%d err=%v, want 2 and an error", n, err)
+	}
+	batch := &batchCountingSink{countingSink: countingSink{failAt: -1}}
+	if n, err := RecordAll(ctx, batch, facts); n != 3 || err != nil || batch.batches != 1 {
+		t.Fatalf("batch sink: n=%d err=%v batches=%d, want one batch of 3", n, err, batch.batches)
+	}
+	failing := &batchCountingSink{fail: true}
+	if n, err := RecordAll(ctx, failing, facts); n != 0 || err == nil {
+		t.Fatalf("failing batch sink: n=%d err=%v, want 0 and an error", n, err)
+	}
+	if n, err := RecordAll(ctx, per, nil); n != 0 || err != nil {
+		t.Fatalf("empty: n=%d err=%v", n, err)
 	}
 }

@@ -2,7 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log/slog"
+	"maps"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +159,16 @@ func (h *SessionHandle) recordInvocationTelemetry(ctx context.Context) {
 	// Read the cursor BEFORE extracting: it bounds how far back the scan
 	// window must reach, so invocations appended since the last pass are not
 	// lost to the fixed tail window.
+	// The cursor points into the transcript the controller sweep last recorded.
+	// When the session has since moved to a new transcript (a restart or a
+	// context reset), the sweep must first finish the old one; leave the switch
+	// to it rather than advancing the cursor into the new file here, which would
+	// strand the old transcript's unrecorded tail.
+	if recorded := strings.TrimSpace(pr.Metadata[sessionpkg.MetadataKeyInvocationUsageTranscript]); recorded != "" && recorded != strings.TrimSpace(path) {
+		slog.Debug("invocation telemetry: transcript changed since the last sweep; leaving it to the sweep",
+			slog.String("session_id", id), slog.String("provider", providerFamily))
+		return
+	}
 	cursor := strings.TrimSpace(pr.Metadata[sessionpkg.MetadataKeyInvocationUsageCursor])
 	usages, err := spec.extract(h.adapter, path, cursor)
 	if err != nil {
@@ -259,6 +273,7 @@ func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sess
 		SessionID: strings.TrimSpace(sessionID),
 		// StepID intentionally unset — run-level attribution (see body note).
 		Worker:              strings.TrimSpace(worker),
+		Agent:               usageAgent(meta),
 		Kind:                usage.KindModel,
 		Model:               strings.TrimSpace(u.Model),
 		Provider:            strings.TrimSpace(providerFamily),
@@ -269,9 +284,22 @@ func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sess
 		CostUSDEstimate:     cost,
 		Unpriced:            !priced,
 		UpstreamReqID:       reqID,
+		RequestID:           strings.TrimSpace(u.RequestID),
 		At:                  at.UnixMilli(),
 		IdempotencyKey:      usage.ModelIdempotencyKey(runID, reqID),
 	}
+}
+
+// usageAgent resolves the configured agent a session runs — its template, which
+// every pool slot of one agent shares — falling back to the agent name, alias,
+// and session name. It is the per-agent (per-role) rollup key gc costs groups by.
+func usageAgent(meta map[string]string) string {
+	for _, k := range []string{"template", "agent_name", "alias", "session_name"} {
+		if v := strings.TrimSpace(meta[k]); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // invocationUsageSpec binds one transcript provider family to its bounded
@@ -282,9 +310,18 @@ func modelUsageFact(u sessionlog.TailUsage, meta map[string]string, beadID, sess
 // filename uuid) or wake-window+cwd bounded, and the claude route is
 // session-keyed with an ambiguity-guarded same-workdir fallback. All errors
 // are swallowed so telemetry never affects operations.
+//
+// extract serves the prompt-op seam. sweepExtract serves the controller sweep,
+// which owns the transcript outright and so may read all of it when it has no
+// cursor yet. subagents, when non-nil, lists the subagent transcripts that sit
+// beside a parent transcript (Claude Code writes each subagent's API calls to
+// its own file, never to the parent); their usage is billed to the parent
+// session.
 type invocationUsageSpec struct {
-	discover func(h *SessionHandle, id string, createdAt time.Time, meta map[string]string) string
-	extract  func(a SessionLogAdapter, path, cursorID string) ([]sessionlog.TailUsage, error)
+	discover     func(h *SessionHandle, id string, createdAt time.Time, meta map[string]string) string
+	extract      func(a SessionLogAdapter, path, cursorID string) ([]sessionlog.TailUsage, error)
+	sweepExtract func(a SessionLogAdapter, path, cursorID string) ([]sessionlog.TailUsage, error)
+	subagents    func(parentPath string) ([]string, error)
 }
 
 // codexInvocationDiscoveryWindow bounds how far after the wake anchor a
@@ -299,12 +336,15 @@ const codexInvocationDiscoveryWindow = 10 * time.Minute
 // any transcript discovery runs.
 var invocationUsageSpecs = map[string]invocationUsageSpec{
 	"claude": {
-		discover: discoverInvocationTranscriptViaManager,
-		extract:  SessionLogAdapter.TailUsage,
+		discover:     discoverInvocationTranscriptViaManager,
+		extract:      SessionLogAdapter.TailUsage,
+		sweepExtract: SessionLogAdapter.UsageSince,
+		subagents:    sessionlog.FindAgentFiles,
 	},
 	"codex": {
-		discover: discoverCodexInvocationTranscript,
-		extract:  SessionLogAdapter.CodexTailUsage,
+		discover:     discoverCodexInvocationTranscript,
+		extract:      SessionLogAdapter.CodexTailUsage,
+		sweepExtract: SessionLogAdapter.CodexTailUsage,
 	},
 }
 
@@ -486,25 +526,23 @@ func usagesSinceCursor(usages []sessionlog.TailUsage, cursor string) []sessionlo
 // Coverage ceiling, per transcript family — the two families differ, and the
 // difference is deliberate:
 //
-//   - claude: cursor-bounded growth, capped at 16MB — once a cursor exists.
-//     SessionLogAdapter.TailUsage routes to sessionlog.ExtractTailUsageSince,
-//     whose window doubles from the 64KB tail until the persisted cursor is
-//     in view, the whole file is in view, or the growth cap is reached — so a
-//     very long autonomous interval recovers its whole backlog rather than
-//     only its final few invocations. Only entries older than that capped
+//   - claude: the whole transcript, then cursor-bounded growth, capped at 16MB.
+//     The sweep reads through SessionLogAdapter.UsageSince
+//     (sessionlog.ExtractUsageSince): with no cursor yet it reads the entire
+//     transcript, so a session first swept late (one already running at
+//     deploy, or a conversation that just replaced its predecessor) is
+//     recorded from its first invocation; with a cursor, the window doubles
+//     from the 64KB tail until the cursor is in view, the whole file is in
+//     view, or the growth cap is reached. Only entries older than that capped
 //     window are lost, and the extractor logs the path, window, and cursor
-//     when it drops them.
-//     Before a cursor exists none of that applies. PersistInvocationUsageCursor
-//     no-ops on an empty value, so the cursor stays unset until some seam
-//     records an invocation; until then ExtractTailUsageSince short-circuits to
-//     one fixed tailChunkSize (64KB) read, never entering the growth loop and
-//     so never emitting the cap log. That first pass is the pre-change
-//     behavior — everything older than 64KB is dropped silently — and the
-//     cursor it then persists becomes the growth loop's stop condition, so no
-//     later pass reaches back across the gap. Both sweep lanes take this path:
-//     SweepSessionModelUsage and SweepSessionModelUsageAtPath share
-//     sweepResolvedTranscript, which reads the cursor from session-bead
-//     metadata.
+//     when it drops them. Subagent transcripts (Claude Code writes each
+//     subagent's calls to {session}/subagents/agent-*.jsonl beside the parent,
+//     never into it) are read the same way, each behind its own cursor in
+//     sessionpkg.InvocationUsageProgress. When a restart or context reset moves
+//     the session to a new transcript, the sweep finishes the transcript its
+//     progress names before moving on, so the old conversation's tail is not
+//     stranded; only a second switch inside one sweep interval can still skip
+//     the middle transcript.
 //   - codex: still the fixed 64KB tail, and still silently lossy.
 //     SessionLogAdapter.CodexTailUsage accepts the cursor and discards it, so a
 //     very long autonomous interval recovers only its final few invocations and
@@ -655,23 +693,123 @@ func (f *Factory) SweepSessionModelUsageAtPath(ctx context.Context, id string, m
 
 // sweepResolvedTranscript owns the post-discovery model-usage sweep shared by
 // the discovery-driven and already-resolved entry points.
+//
+// It records every invocation the session's transcripts hold past the persisted
+// progress (sessionpkg.InvocationUsageProgress): the parent transcript at path,
+// and — for families with subagent transcripts — every subagent transcript
+// beside it, each behind its own cursor. When the progress belongs to a
+// different transcript than path (the session restarted or reset its context
+// since the last sweep, so it now writes a new file), the old transcript and its
+// subagents are finished first, and only then does the progress move to path,
+// which is then read from its first invocation. The progress is persisted in one
+// write after the sweep, advanced only through what reached the sink.
 func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string, meta map[string]string, path string, now time.Time) (emitted int, settled bool, err error) {
-	sink := f.usageSink
-	// Read the cursor BEFORE extracting: it bounds how far back the scan
-	// window must reach, so a sweep that falls more than one window behind
-	// still recovers the whole backlog instead of the tail's last few entries.
-	cursor := strings.TrimSpace(meta[sessionpkg.MetadataKeyInvocationUsageCursor])
-	usages, extractErr := f.Adapter().InvocationUsage(family, path, cursor)
+	spec := invocationUsageSpecs[family]
+	path = strings.TrimSpace(path)
+	start := sessionpkg.InvocationUsageProgressFromMetadata(meta)
+	progress := start
+	if progress.Transcript == "" {
+		// Recorded before transcripts were tracked: the cursor belongs to the
+		// transcript the session resolves to now.
+		progress.Transcript = path
+	}
+	if progress.Transcript != path {
+		n, done, ferr := f.sweepTranscriptTree(ctx, family, spec, id, meta, &progress, now, true)
+		emitted += n
+		if !done {
+			f.persistSweepProgress(id, start, progress)
+			return emitted, false, ferr
+		}
+		slog.Debug("model-usage sweep: previous transcript finished; moving to the current one",
+			slog.String("session_id", id), slog.String("provider", family))
+		progress = sessionpkg.InvocationUsageProgress{Transcript: path}
+	}
+	n, done, serr := f.sweepTranscriptTree(ctx, family, spec, id, meta, &progress, now, false)
+	emitted += n
+	f.persistSweepProgress(id, start, progress)
+	return emitted, done, serr
+}
+
+// sweepTranscriptTree records the usage pending in progress.Transcript and its
+// subagent transcripts, advancing progress in place through what reached the
+// sink. done reports that every file was read and fully recorded. err is
+// reserved for a sink Record failure; a read failure is a transient miss
+// (done=false, err=nil) retried on a later tick. finishing marks a transcript the
+// session has moved away from: a parent that no longer exists then has nothing
+// left to record, rather than being a not-yet-flushed file worth retrying.
+func (f *Factory) sweepTranscriptTree(ctx context.Context, family string, spec invocationUsageSpec, id string, meta map[string]string, progress *sessionpkg.InvocationUsageProgress, now time.Time, finishing bool) (emitted int, done bool, err error) {
+	adapter := f.Adapter()
+	usages, extractErr := spec.sweepExtract(adapter, progress.Transcript, progress.Cursor)
 	if extractErr != nil {
+		if finishing && errors.Is(extractErr, fs.ErrNotExist) {
+			return 0, true, nil
+		}
 		// Transient: a torn mid-write tail can fail the parse; retry on a later tick.
 		slog.Debug("model-usage sweep: usage extraction failed; will retry",
 			slog.String("session_id", id), slog.String("provider", family), slog.Any("error", extractErr))
 		return 0, false, nil
 	}
-	pending := usagesSinceCursor(usages, cursor)
+	n, recErr := f.recordSweptUsages(ctx, family, meta, id, usagesSinceCursor(usages, progress.Cursor), &progress.Cursor, now)
+	emitted += n
+	if recErr != nil {
+		return emitted, false, recErr
+	}
+	if spec.subagents == nil {
+		return emitted, true, nil
+	}
+	files, listErr := spec.subagents(progress.Transcript)
+	if listErr != nil {
+		slog.Debug("model-usage sweep: listing subagent transcripts failed; will retry",
+			slog.String("session_id", id), slog.String("provider", family), slog.Any("error", listErr))
+		return emitted, false, nil
+	}
+	// Rebuild the cursor map from the files present, so a subagent transcript
+	// that no longer exists stops occupying session metadata.
+	cursors := make(map[string]string, len(files))
+	defer func() {
+		if len(cursors) == 0 {
+			cursors = nil
+		}
+		progress.Subagents = cursors
+	}()
+	done = true
+	for _, file := range files {
+		name := filepath.Base(file)
+		cursor := progress.Subagents[name]
+		subUsages, subErr := spec.sweepExtract(adapter, file, cursor)
+		if subErr != nil {
+			slog.Debug("model-usage sweep: subagent usage extraction failed; will retry",
+				slog.String("session_id", id), slog.String("transcript", name), slog.Any("error", subErr))
+			if cursor != "" {
+				cursors[name] = cursor
+			}
+			done = false
+			continue
+		}
+		n, recErr := f.recordSweptUsages(ctx, family, meta, id, usagesSinceCursor(subUsages, cursor), &cursor, now)
+		emitted += n
+		if cursor != "" {
+			cursors[name] = cursor
+		}
+		if recErr != nil {
+			// Keep the cursors of the files not reached yet.
+			for name, c := range progress.Subagents {
+				if _, seen := cursors[name]; !seen {
+					cursors[name] = c
+				}
+			}
+			return emitted, false, recErr
+		}
+	}
+	return emitted, done, nil
+}
+
+// recordSweptUsages emits the gc.agent.tokens.* / cost metrics for each pending
+// invocation and records one model fact per invocation to the factory's usage
+// sink in a single batch, advancing *cursor through the last recorded one.
+func (f *Factory) recordSweptUsages(ctx context.Context, family string, meta map[string]string, id string, pending []sessionlog.TailUsage, cursor *string, now time.Time) (int, error) {
 	if len(pending) == 0 {
-		// Swept: the transcript was read and the cursor is already current.
-		return 0, true, nil
+		return 0, nil
 	}
 	registry := f.pricing
 	if registry == nil {
@@ -679,7 +817,7 @@ func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string
 	}
 	workerName := strings.TrimSpace(meta["session_name"])
 	agentName := sweepAgentName(meta)
-	lastRecorded := ""
+	facts := make([]usage.Fact, 0, len(pending))
 	for _, u := range pending {
 		cost, priced := registry.Estimate(family, u.Model, pricing.Usage{
 			PromptTokens:        u.InputTokens,
@@ -703,27 +841,29 @@ func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string
 		if priced {
 			telemetry.RecordInvocationCostEstimate(ctx, labels, cost)
 		}
-		fact := modelUsageFact(u, meta, id, id, workerName, family, cost, priced, now)
-		if recErr := sink.Record(ctx, fact); recErr != nil {
-			// Stop at the first failure and advance the cursor only through the last
-			// success, so the next sweep resumes here instead of skipping the gap.
-			err = recErr
-			break
-		}
-		emitted++
-		lastRecorded = usageIdentity(u)
+		facts = append(facts, modelUsageFact(u, meta, id, id, workerName, family, cost, priced, now))
 	}
-	if lastRecorded != "" {
-		if cursorErr := f.manager.PersistInvocationUsageCursor(id, lastRecorded); cursorErr != nil {
-			slog.Debug("model-usage sweep: persisting invocation usage cursor failed; next sweep may re-record",
-				slog.String("session_id", id), slog.Any("error", cursorErr))
-		}
+	// Advance the cursor only through what reached the sink, so the next sweep
+	// resumes at the gap instead of skipping it; IdempotencyKey collapses any
+	// fact a retried batch records twice.
+	n, err := usage.RecordAll(ctx, f.usageSink, facts)
+	if n > 0 {
+		*cursor = usageIdentity(pending[n-1])
 	}
-	// Settled only when the whole pending batch reached the sink: a sink Record
-	// failure (err != nil) leaves the interval unsettled so the caller retries the
-	// remainder — the cursor advanced only through the last success, and the
-	// IdempotencyKey collapses any already-recorded fact on the retry.
-	return emitted, err == nil, err
+	return n, err
+}
+
+// persistSweepProgress stores progress on the session bead when the sweep moved
+// it. A failed write is logged: the next sweep re-records from the old progress
+// and IdempotencyKey collapses the overlap.
+func (f *Factory) persistSweepProgress(id string, before, after sessionpkg.InvocationUsageProgress) {
+	if before.Transcript == after.Transcript && before.Cursor == after.Cursor && maps.Equal(before.Subagents, after.Subagents) {
+		return
+	}
+	if err := f.manager.PersistInvocationUsageProgress(id, after); err != nil {
+		slog.Debug("model-usage sweep: persisting invocation usage progress failed; next sweep may re-record",
+			slog.String("session_id", id), slog.Any("error", err))
+	}
 }
 
 // discoverSweepTranscript resolves the transcript for the end-of-interval model

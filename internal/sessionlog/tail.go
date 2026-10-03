@@ -188,6 +188,7 @@ type tailEntry struct {
 	Type      string          `json:"type"`
 	Subtype   string          `json:"subtype,omitempty"`
 	UUID      string          `json:"uuid"`
+	RequestID string          `json:"requestId,omitempty"`
 	Message   json.RawMessage `json:"message"`
 	Timestamp tailTime        `json:"timestamp"`
 }
