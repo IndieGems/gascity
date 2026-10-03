@@ -99,15 +99,16 @@ func (discardSink) Record(context.Context, Fact) error { return nil }
 // durable write. [RecordAll] uses it when available.
 type BatchSink interface {
 	Sink
-	// RecordBatch records every fact in facts or none of them: on error the
-	// caller must treat the whole batch as unrecorded and retry it.
+	// RecordBatch records facts as one durable write. On error the caller must
+	// retry the whole batch; a prefix may already be durable and is collapsed
+	// by IdempotencyKey.
 	RecordBatch(ctx context.Context, facts []Fact) error
 }
 
 // RecordAll records facts in order, as one durable write when sink implements
 // [BatchSink] and one Record per fact otherwise. It returns how many leading
 // facts are known recorded: on a per-fact sink it stops at the first failure
-// and returns the count before it; on a batch sink it is all or nothing.
+// and returns the count before it; on a batch sink it reports all or none.
 func RecordAll(ctx context.Context, sink Sink, facts []Fact) (int, error) {
 	if len(facts) == 0 {
 		return 0, nil

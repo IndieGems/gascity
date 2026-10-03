@@ -1,6 +1,7 @@
 package sessionlog
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -373,8 +374,11 @@ func TestExtractTailUsageFromSearchPathsRejectsEscapedPath(t *testing.T) {
 		},
 	}})
 
-	if _, err := ExtractTailUsageFromSearchPaths([]string{root}, outside); err == nil {
-		t.Fatal("ExtractTailUsageFromSearchPaths outside root = nil error, want rejection")
+	if _, err := ExtractTailUsageFromSearchPaths([]string{root}, outside); !errors.Is(err, ErrOutsideSearchPaths) {
+		t.Fatalf("ExtractTailUsageFromSearchPaths outside root error = %v, want ErrOutsideSearchPaths", err)
+	}
+	if _, err := ExtractUsageSinceFromSearchPaths([]string{root}, outside, ""); !errors.Is(err, ErrOutsideSearchPaths) {
+		t.Fatalf("ExtractUsageSinceFromSearchPaths outside root error = %v, want ErrOutsideSearchPaths", err)
 	}
 
 	inside := filepath.Join(root, "session.jsonl")

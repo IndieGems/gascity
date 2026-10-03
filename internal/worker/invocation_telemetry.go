@@ -735,30 +735,36 @@ func (f *Factory) sweepResolvedTranscript(ctx context.Context, family, id string
 // sink. done reports that every file was read and fully recorded. err is
 // reserved for a sink Record failure; a read failure is a transient miss
 // (done=false, err=nil) retried on a later tick. finishing marks a transcript the
-// session has moved away from: a parent that no longer exists then has nothing
-// left to record, rather than being a not-yet-flushed file worth retrying.
+// session has moved away from: a file there that a retry cannot read (see
+// unrecoverableSweepRead) has nothing more to give, so it is skipped rather than
+// holding the sweep back from the session's current transcript.
 func (f *Factory) sweepTranscriptTree(ctx context.Context, family string, spec invocationUsageSpec, id string, meta map[string]string, progress *sessionpkg.InvocationUsageProgress, now time.Time, finishing bool) (emitted int, done bool, err error) {
 	adapter := f.Adapter()
 	usages, extractErr := spec.sweepExtract(adapter, progress.Transcript, progress.Cursor)
 	if extractErr != nil {
-		if finishing && errors.Is(extractErr, fs.ErrNotExist) {
-			return 0, true, nil
+		if !finishing || !unrecoverableSweepRead(extractErr) {
+			// Transient: a torn mid-write tail can fail the parse; retry on a later tick.
+			slog.Debug("model-usage sweep: usage extraction failed; will retry",
+				slog.String("session_id", id), slog.String("provider", family), slog.Any("error", extractErr))
+			return 0, false, nil
 		}
-		// Transient: a torn mid-write tail can fail the parse; retry on a later tick.
-		slog.Debug("model-usage sweep: usage extraction failed; will retry",
-			slog.String("session_id", id), slog.String("provider", family), slog.Any("error", extractErr))
-		return 0, false, nil
-	}
-	n, recErr := f.recordSweptUsages(ctx, family, meta, id, usagesSinceCursor(usages, progress.Cursor), &progress.Cursor, now)
-	emitted += n
-	if recErr != nil {
-		return emitted, false, recErr
+		logSkippedSweepTranscript(id, family, progress.Transcript, extractErr)
+	} else {
+		n, recErr := f.recordSweptUsages(ctx, family, meta, id, usagesSinceCursor(usages, progress.Cursor), &progress.Cursor, now)
+		emitted += n
+		if recErr != nil {
+			return emitted, false, recErr
+		}
 	}
 	if spec.subagents == nil {
 		return emitted, true, nil
 	}
 	files, listErr := spec.subagents(progress.Transcript)
 	if listErr != nil {
+		if finishing && unrecoverableSweepRead(listErr) {
+			logSkippedSweepTranscript(id, family, progress.Transcript, listErr)
+			return emitted, true, nil
+		}
 		slog.Debug("model-usage sweep: listing subagent transcripts failed; will retry",
 			slog.String("session_id", id), slog.String("provider", family), slog.Any("error", listErr))
 		return emitted, false, nil
@@ -777,6 +783,10 @@ func (f *Factory) sweepTranscriptTree(ctx context.Context, family string, spec i
 		name := filepath.Base(file)
 		cursor := progress.Subagents[name]
 		subUsages, subErr := spec.sweepExtract(adapter, file, cursor)
+		if subErr != nil && finishing && unrecoverableSweepRead(subErr) {
+			logSkippedSweepTranscript(id, family, file, subErr)
+			continue
+		}
 		if subErr != nil {
 			slog.Debug("model-usage sweep: subagent usage extraction failed; will retry",
 				slog.String("session_id", id), slog.String("transcript", name), slog.Any("error", subErr))
@@ -802,6 +812,28 @@ func (f *Factory) sweepTranscriptTree(ctx context.Context, family string, spec i
 		}
 	}
 	return emitted, done, nil
+}
+
+// unrecoverableSweepRead reports a transcript read error that retrying the same
+// path cannot fix: the file is gone, the process may not read it, or it lies
+// outside the configured search roots.
+func unrecoverableSweepRead(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, fs.ErrPermission) ||
+		errors.Is(err, sessionlog.ErrOutsideSearchPaths)
+}
+
+// logSkippedSweepTranscript records that the sweep gave up on a finished
+// transcript. A deleted file is routine cleanup; any other unrecoverable error
+// means usage the session spent is going unrecorded, so it is a warning.
+func logSkippedSweepTranscript(id, family, path string, err error) {
+	level := slog.LevelWarn
+	if errors.Is(err, fs.ErrNotExist) {
+		level = slog.LevelDebug
+	}
+	slog.Log(context.Background(), level, "model-usage sweep: cannot read a finished transcript; skipping its remaining usage",
+		slog.String("session_id", id), slog.String("provider", family),
+		slog.String("transcript", path), slog.Any("error", err))
 }
 
 // recordSweptUsages emits the gc.agent.tokens.* / cost metrics for each pending

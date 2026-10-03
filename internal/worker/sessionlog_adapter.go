@@ -169,18 +169,6 @@ func (a SessionLogAdapter) InvocationUsage(provider, path, cursorID string) ([]s
 	return invocationUsageSpecs[family].extract(a, path, cursorID)
 }
 
-// SweepInvocationUsage reads per-invocation token usage for the controller's
-// model-usage sweep using the provider family's sweep extractor
-// (invocationUsageSpecs). It returns (nil, nil) for families without
-// invocation-telemetry support.
-func (a SessionLogAdapter) SweepInvocationUsage(provider, path, cursorID string) ([]sessionlog.TailUsage, error) {
-	family, ok := InvocationUsageFamily(provider)
-	if !ok {
-		return nil, nil
-	}
-	return invocationUsageSpecs[family].sweepExtract(a, path, cursorID)
-}
-
 // TailActivityForProvider reads tail activity for a provider whose transcript
 // tail cannot be read from a trailing record. Whole-file-JSON mirror families
 // need the normalized history; everything else keeps the cheap tail path.

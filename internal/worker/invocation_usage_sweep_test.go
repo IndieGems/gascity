@@ -242,6 +242,76 @@ func TestFactorySweepMovesOnWhenPreviousTranscriptIsGone(t *testing.T) {
 	}
 }
 
+// TestFactorySweepMovesOnWhenPreviousTranscriptIsUnreadable pins that a previous
+// transcript a retry cannot read — the process may not open it, or it now lies
+// outside the configured search roots — is skipped rather than retried forever,
+// so the session's current transcript is still recorded. A readable subagent of
+// the skipped transcript is still recorded too.
+func TestFactorySweepMovesOnWhenPreviousTranscriptIsUnreadable(t *testing.T) {
+	tests := []struct {
+		name string
+		// previous writes the previous transcript and returns its path.
+		previous func(t *testing.T, fx *sweepFixture) string
+		// wantPrevious lists the previous transcript tree's calls that are still recorded.
+		wantPrevious []string
+	}{
+		{
+			name: "permission denied",
+			previous: func(t *testing.T, fx *sweepFixture) string {
+				if os.Geteuid() == 0 {
+					t.Skip("root reads files regardless of mode")
+				}
+				path := filepath.Join(fx.slugDir, "unreadable.jsonl")
+				writeWorkerTestJSONL(t, path, []map[string]any{
+					usageEntryWithMessageID("o1", "msg-o1", 10, 1, 0, 0),
+				})
+				writeWorkerTestJSONL(t, subagentTranscript(t, path, "old"), []map[string]any{
+					usageEntryWithMessageID("os1", "msg-os1", 10, 1, 0, 0),
+				})
+				if err := os.Chmod(path, 0); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+				return path
+			},
+			wantPrevious: []string{"msg-os1"},
+		},
+		{
+			name: "outside search roots",
+			previous: func(t *testing.T, _ *sweepFixture) string {
+				path := filepath.Join(t.TempDir(), "moved.jsonl")
+				writeWorkerTestJSONL(t, path, []map[string]any{
+					usageEntryWithMessageID("o1", "msg-o1", 10, 1, 0, 0),
+				})
+				return path
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := newSweepFixture(t)
+			previous := tt.previous(t, fx)
+			if err := fx.store.SetMetadata(fx.id, sessionpkg.MetadataKeyInvocationUsageTranscript, previous); err != nil {
+				t.Fatal(err)
+			}
+			writeWorkerTestJSONL(t, fx.transcript(t), []map[string]any{
+				usageEntryWithMessageID("n1", "msg-n1", 10, 1, 0, 0),
+			})
+			want := append(append([]string(nil), tt.wantPrevious...), "msg-n1")
+			if emitted, settled := fx.sweep(t); !settled || emitted != len(want) {
+				t.Fatalf("sweep: emitted=%d settled=%v, want %d settled", emitted, settled, len(want))
+			}
+			if got := upstreamIDs(fx.facts(t)); strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("recorded calls = %v, want %v", got, want)
+			}
+			progress := sessionpkg.InvocationUsageProgressFromMetadata(fx.meta(t))
+			if progress.Transcript != fx.transcript(t) || progress.Cursor != "msg-n1" || len(progress.Subagents) != 0 {
+				t.Fatalf("progress = %+v, want the current transcript at msg-n1 with no subagent cursors", progress)
+			}
+		})
+	}
+}
+
 // TestFactorySweepFactCarriesRequestIDAndAgent pins the fields gc costs
 // deduplicates and groups on: the provider request id, and the configured agent
 // (template) the session runs.
