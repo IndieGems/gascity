@@ -16,9 +16,10 @@ import (
 // threshold, paused so the TUI reads each burst on its own.
 const (
 	// claudeMaxTypedBurstBytes keeps each burst under Claude Code's
-	// 800-character paste threshold. It counts bytes, which never undercount
-	// the UTF-16 code units Claude Code measures, and leaves headroom.
-	claudeMaxTypedBurstBytes = 640
+	// 800-character paste threshold even when a busy TUI reads two bursts in
+	// one go. It counts bytes, which never undercount the UTF-16 code units
+	// Claude Code measures.
+	claudeMaxTypedBurstBytes = 384
 	// claudeTypedBurstDelay separates bursts so the pty does not hand Claude
 	// Code two of them in one read.
 	claudeTypedBurstDelay = 100 * time.Millisecond

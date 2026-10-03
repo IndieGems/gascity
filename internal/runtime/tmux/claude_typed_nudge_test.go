@@ -186,3 +186,100 @@ func TestNudgeSessionTypesLongClaudeNudgeWithoutPasting(t *testing.T) {
 		t.Fatalf("typed text differs from the nudge (got %d bytes, want %d)", len(got), len(text))
 	}
 }
+
+// assertNoInteriorSemicolonCut fails when any chunk but the last ends in ';'.
+// tmux reads a send-keys argument ending in ';' as a command separator and
+// drops the ';', so such a cut would silently lose a character.
+func assertNoInteriorSemicolonCut(t *testing.T, text string, chunks []string) {
+	t.Helper()
+	if got := strings.Join(chunks, ""); got != text {
+		t.Fatalf("joined chunks = %q, want %q", got, text)
+	}
+	for i, chunk := range chunks[:len(chunks)-1] {
+		if chunk == "" {
+			t.Fatalf("chunk %d is empty: %q", i, chunks)
+		}
+		if strings.HasSuffix(chunk, ";") {
+			t.Fatalf("chunk %d = %q ends in ';', which tmux strips: %q", i, chunk, chunks)
+		}
+	}
+}
+
+func TestSplitPasteTextMovesCutBeforeSemicolon(t *testing.T) {
+	text := "abcd;efghij"
+	chunks := splitPasteText(text, 5)
+
+	assertNoInteriorSemicolonCut(t, text, chunks)
+	if want := []string{"abcd", ";efgh", "ij"}; !slices.Equal(chunks, want) {
+		t.Fatalf("chunks = %q, want %q", chunks, want)
+	}
+}
+
+func TestSplitPasteTextMovesCutBeforeSemicolonRun(t *testing.T) {
+	text := "ab;;;cdefgh"
+	chunks := splitPasteText(text, 5)
+
+	assertNoInteriorSemicolonCut(t, text, chunks)
+	if want := []string{"ab", ";;;cd", "efgh"}; !slices.Equal(chunks, want) {
+		t.Fatalf("chunks = %q, want %q", chunks, want)
+	}
+}
+
+func TestSplitPasteTextKeepsAllSemicolonTextInFinalBurst(t *testing.T) {
+	text := strings.Repeat(";", 12)
+	chunks := splitPasteText(text, 5)
+
+	if want := []string{text}; !slices.Equal(chunks, want) {
+		t.Fatalf("chunks = %q, want the whole run as the final burst %q", chunks, want)
+	}
+}
+
+func TestSplitPasteTextCarriesOversizedSemicolonRunPastTheRun(t *testing.T) {
+	text := ";;;;;;;é;;xyz"
+	chunks := splitPasteText(text, 5)
+
+	assertNoInteriorSemicolonCut(t, text, chunks)
+	if want := []string{";;;;;;;é", ";;xyz"}; !slices.Equal(chunks, want) {
+		t.Fatalf("chunks = %q, want %q", chunks, want)
+	}
+}
+
+func TestSendNudgeTextNeverEndsAClaudeBurstInSemicolon(t *testing.T) {
+	ex := &providerPaneExecutor{provider: "claude"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+	text := strings.Repeat("x", claudeMaxTypedBurstBytes-1) + ";" + strings.Repeat("y", 200) + "\n"
+
+	if err := tm.sendNudgeTextWithRetry("%1", text, 3*time.Second); err != nil {
+		t.Fatalf("sendNudgeTextWithRetry() = %v, want nil", err)
+	}
+
+	assertNoInteriorSemicolonCut(t, text, ex.literalSends())
+}
+
+func TestClaudeTypedBurstPairStaysBelowPasteThreshold(t *testing.T) {
+	// A busy TUI can read two bursts in one go; together they must still stay
+	// under Claude Code's 800-character paste threshold.
+	if pair := 2 * claudeMaxTypedBurstBytes; pair >= 800 {
+		t.Fatalf("two coalesced bursts = %d bytes, want < 800", pair)
+	}
+}
+
+func TestNudgePaneTypesLongClaudeNudgeWithoutPasting(t *testing.T) {
+	ex := &providerPaneExecutor{provider: "claude"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+	text := longSlackReminder(5000)
+
+	if err := tm.NudgePane("%7", text); err != nil {
+		t.Fatalf("NudgePane() = %v, want nil", err)
+	}
+	if n := ex.commandCount("paste-buffer"); n != 0 {
+		t.Fatalf("paste-buffer calls = %d, want 0", n)
+	}
+	sends := ex.literalSends()
+	if len(sends) < 2 {
+		t.Fatalf("literal sends = %d, want the nudge split into several bursts", len(sends))
+	}
+	if got := strings.Join(sends, ""); got != text {
+		t.Fatalf("typed text differs from the nudge (got %d bytes, want %d)", len(got), len(text))
+	}
+}
