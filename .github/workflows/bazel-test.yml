@@ -45,6 +45,9 @@ permissions:
 jobs:
   bazel:
     name: bazel test (side-by-side)
+    # Needs Blacksmith and the upstream RBE farm/cache; repository forks skip
+    # it (a skipped job reports as passed) and rely on ci.yml's Go test arm.
+    if: github.repository == 'gastownhall/gascity'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 90
     permissions:
@@ -268,7 +271,9 @@ jobs:
 
   sync-check:
     name: BUILD files in sync
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Cheap and secret-free, so repository forks without Blacksmith runners
+    # run it on GitHub-hosted runners instead.
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
