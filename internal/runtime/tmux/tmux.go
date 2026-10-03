@@ -2309,32 +2309,37 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 
 func (t *Tmux) sendStartupKeysLiteralWithRetry(target, text, provider string, timeout time.Duration) error {
 	if len(text) > copilotMaxPasteBytes && sessionlog.ProviderFamily(provider) == "copilot" {
-		chunks := splitPasteText(text, copilotMaxPasteBytes)
-		// Budget the inter-chunk pauses on top of the retry window rather than
-		// out of it. Spending them from `timeout` would shrink each chunk's
-		// share of the configured readiness budget as the prompt grows, making
-		// large prompts more timeout-prone -- the exact case chunking targets.
-		// The deadline is shared across every chunk rather than per-chunk, so a
-		// retry-heavy first chunk can starve the later ones and turn what would
-		// have been a plain timeout into errPartialPasteDelivery.
-		deadline := time.Now().Add(timeout + time.Duration(len(chunks)-1)*copilotPasteChunkDelay)
-		return sendPasteChunks(chunks, func(chunk string) error {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				return fmt.Errorf("agent not ready for input after %s", timeout)
-			}
-			return t.sendTextWithRetry(target, chunk, remaining, t.pasteLiteralText)
-		}, func() {
-			remaining := time.Until(deadline)
-			if remaining > copilotPasteChunkDelay {
-				remaining = copilotPasteChunkDelay
-			}
-			if remaining > 0 {
-				time.Sleep(remaining)
-			}
-		})
+		return t.sendChunksWithRetry(target, splitPasteText(text, copilotMaxPasteBytes), copilotPasteChunkDelay, timeout, t.pasteLiteralText)
 	}
 	return t.sendTextWithRetry(target, text, timeout, t.sendLiteralText)
+}
+
+// sendChunksWithRetry delivers chunks in order with send, retrying each on
+// transient errors and pausing delay between consecutive chunks.
+func (t *Tmux) sendChunksWithRetry(target string, chunks []string, delay, timeout time.Duration, send func(string, string) error) error {
+	// Budget the inter-chunk pauses on top of the retry window rather than
+	// out of it. Spending them from `timeout` would shrink each chunk's
+	// share of the configured readiness budget as the prompt grows, making
+	// large prompts more timeout-prone -- the exact case chunking targets.
+	// The deadline is shared across every chunk rather than per-chunk, so a
+	// retry-heavy first chunk can starve the later ones and turn what would
+	// have been a plain timeout into errPartialPasteDelivery.
+	deadline := time.Now().Add(timeout + time.Duration(len(chunks)-1)*delay)
+	return sendPasteChunks(chunks, func(chunk string) error {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("agent not ready for input after %s", timeout)
+		}
+		return t.sendTextWithRetry(target, chunk, remaining, send)
+	}, func() {
+		remaining := time.Until(deadline)
+		if remaining > delay {
+			remaining = delay
+		}
+		if remaining > 0 {
+			time.Sleep(remaining)
+		}
+	})
 }
 
 func (t *Tmux) sendTextWithRetry(target, text string, timeout time.Duration, send func(string, string) error) error {
@@ -2695,7 +2700,7 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	return t.nudgeSession(
 		session,
 		message,
-		t.sendKeysLiteralWithRetry,
+		t.sendNudgeTextWithRetry,
 		func(target string) bool { return t.shouldSendEscapeBeforeEnter(target) },
 		func(target string) []string { return t.nudgeSubmitKeySequence(target) },
 	)
@@ -2975,7 +2980,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	}()
 
 	// 1. Send text in literal mode with retry on transient errors
-	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
+	if err := t.sendNudgeTextWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
 
